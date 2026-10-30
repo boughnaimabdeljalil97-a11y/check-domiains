@@ -4,6 +4,7 @@ export type FlagValue = 'yes' | 'no' | '?' | 'checking' | 'pending';
 export interface DomainRecord {
   id: string;
   domain: string;
+  originalIndex?: number;
   status: CheckStatus;
   registeredOn: string; // 'YYYY-MM-DD' or 'no data'
   updatedOn: string;    // 'YYYY-MM-DD' or 'no data'

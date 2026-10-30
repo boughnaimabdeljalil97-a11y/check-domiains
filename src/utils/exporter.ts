@@ -26,12 +26,17 @@ function triggerDownload(blob: Blob, filename: string) {
 export function exportToExcel(records: DomainRecord[], filename = 'domain-checker-results.xlsx') {
   if (records.length === 0) return;
 
+  // Sort export data strictly by original input index
+  const sortedRecords = [...records].sort(
+    (a, b) => (a.originalIndex ?? 0) - (b.originalIndex ?? 0)
+  );
+
   const wb = XLSX.utils.book_new();
 
   // Columns: Domain | Registered On | Updated On | SSL | Website
   const headers = ['Domain', 'Registered On', 'Updated On', 'SSL', 'Website'];
 
-  const rows = records.map((r) => [
+  const rows = sortedRecords.map((r) => [
     r.domain,
     r.registeredOn,
     r.updatedOn,
@@ -143,6 +148,11 @@ export function exportToExcel(records: DomainRecord[], filename = 'domain-checke
 export function exportToCsv(records: DomainRecord[], filename = 'domain-checker-results.csv') {
   if (records.length === 0) return;
 
+  // Sort export data strictly by original input index
+  const sortedRecords = [...records].sort(
+    (a, b) => (a.originalIndex ?? 0) - (b.originalIndex ?? 0)
+  );
+
   const headers = ['Domain', 'Registered On', 'Updated On', 'SSL', 'Website'];
 
   const escapeCsv = (val: any) => {
@@ -155,7 +165,7 @@ export function exportToCsv(records: DomainRecord[], filename = 'domain-checker-
 
   const csvRows = [
     headers.join(','),
-    ...records.map((r) =>
+    ...sortedRecords.map((r) =>
       [
         escapeCsv(r.domain),
         escapeCsv(r.registeredOn),

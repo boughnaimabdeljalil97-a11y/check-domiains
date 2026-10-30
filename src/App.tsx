@@ -99,6 +99,7 @@ export default function App() {
     const newRecords: DomainRecord[] = domains.map((d, index) => ({
       id: `${d}-${index}-${Date.now()}`,
       domain: d,
+      originalIndex: index,
       status: 'pending',
       registeredOn: 'no data',
       updatedOn: 'no data',

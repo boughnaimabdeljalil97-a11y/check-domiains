@@ -265,7 +265,7 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({
           {/* Download CSV button */}
           <button
             type="button"
-            onClick={() => exportToCsv(sortedRecords)}
+            onClick={() => exportToCsv(records)}
             className="inline-flex items-center space-x-1 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 border border-slate-200 rounded-xl transition cursor-pointer shadow-xs"
             title="Download CSV"
           >
@@ -276,7 +276,7 @@ export const ResultsTable: React.FC<ResultsTableProps> = ({
           {/* Download Excel (.xlsx) button */}
           <button
             type="button"
-            onClick={() => exportToExcel(sortedRecords)}
+            onClick={() => exportToExcel(records)}
             className="inline-flex items-center space-x-1.5 px-3.5 py-1.5 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 rounded-xl transition cursor-pointer shadow-sm shadow-emerald-600/20"
             title="Download Excel (.xlsx) with styled sheets"
           >
