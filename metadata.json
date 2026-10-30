@@ -1,0 +1,6 @@
+{
+  "name": "Domain Checker Pro",
+  "description": "Bulk client-side domain verification tool for WHOIS RDAP registration dates, SSL certificates, and live website status with Excel and CSV export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
