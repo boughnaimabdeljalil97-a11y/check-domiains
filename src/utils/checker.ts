@@ -294,38 +294,84 @@ export async function checkGoogleDns(
 
 /**
  * SSL check (browser-direct):
- * fetch(`https://${domain}`, { mode: "no-cors" }) with a 12s AbortController timeout.
- * - if the fetch resolves -> SSL = "yes"
- * - if it rejects -> SSL = "no"
- * Website never depends on SSL.
+ * Performs an independent HTTPS request to https://${domain} (and https://www.${cleanHost} if needed)
+ * using { mode: "no-cors", redirect: "manual" }.
+ * - Resolves -> TLS handshake succeeded (certificate valid, trusted, matches domain, not expired) -> SSL = "yes".
+ * - Rejects -> TLS handshake failed (certificate expired, invalid/untrusted, hostname mismatch, connection refused) -> SSL = "no".
+ * - redirect: 'manual' prevents the browser from failing valid SSL handshakes when a domain performs a cross-origin redirect.
+ * - Completely independent of Website Check.
  */
 async function checkSslDirect(
   domain: string,
-  signal: AbortSignal
+  parentSignal?: AbortSignal
 ): Promise<FlagValue> {
+  const timeoutMs = 12000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  const onParentAbort = () => controller.abort();
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      controller.abort();
+    } else {
+      parentSignal.addEventListener('abort', onParentAbort, { once: true });
+    }
+  }
+
+  const cleanHost = domain.replace(/^(www\.)+/i, '');
+  const candidateUrls = [
+    `https://${domain}`,
+    `https://www.${cleanHost}`,
+  ];
+
   try {
-    await fetch(`https://${domain}`, {
-      mode: 'no-cors',
-      signal,
-    });
-    return 'yes';
-  } catch {
+    for (const url of candidateUrls) {
+      if (controller.signal.aborted) break;
+
+      // Try with redirect: 'manual' first (avoids cross-origin redirect TypeError in no-cors)
+      try {
+        await fetch(url, {
+          mode: 'no-cors',
+          redirect: 'manual',
+          signal: controller.signal,
+        });
+        return 'yes';
+      } catch {
+        // Fallback: try standard redirect follow on same URL
+        try {
+          await fetch(url, {
+            mode: 'no-cors',
+            signal: controller.signal,
+          });
+          return 'yes';
+        } catch {
+          // Continue to next candidate URL (e.g. www.)
+        }
+      }
+    }
     return 'no';
+  } finally {
+    clearTimeout(timer);
+    if (parentSignal) {
+      parentSignal.removeEventListener('abort', onParentAbort);
+    }
   }
 }
 
 interface ProxyFetchResult {
   html: string;
   httpCode?: number;
+  sslCertError?: boolean;
 }
 
 /**
- * Fetch with timeout helper supporting custom timeoutMs and AbortSignal
+ * Fetch with timeout helper supporting custom timeoutMs, AbortSignal, and headers
  */
 async function fetchProxyUrl(
   url: string,
-  timeoutMs: number = 4500,
-  parentSignal?: AbortSignal
+  timeoutMs: number = 18000,
+  parentSignal?: AbortSignal,
+  headers?: Record<string, string>
 ): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -340,7 +386,7 @@ async function fetchProxyUrl(
   }
 
   try {
-    const res = await fetch(url, { signal: controller.signal });
+    const res = await fetch(url, { signal: controller.signal, headers });
     return res;
   } finally {
     clearTimeout(timer);
@@ -351,16 +397,18 @@ async function fetchProxyUrl(
 }
 
 /**
- * Reads page content using a resilient proxy chain:
- * 1. Jina Reader: fast, renders JS/SPAs, follows HTTP/HTTPS and JS redirects
- * 2. AllOrigins: returns full HTML + HTTP status code
- * 3. CodeTabs: returns raw HTML
- * Each proxy has a 4.5s timeout so unresponsive protocols/proxies fail fast
- * and allow the HTTP fallback to execute well within the overall domain timeout.
+ * Reads page content using an intelligent, resilient proxy chain:
+ * 1. Direct fetch: fastest if server allows CORS or in Node
+ * 2. Jina Reader: fast, renders JS/SPAs, follows HTTP/HTTPS and JS redirects.
+ *    Uses domcontentloaded so continuous analytics/ads background requests do not block completion.
+ *    Detects SSL certificate errors on HTTPS targets for immediate HTTP fallback.
+ * 3. AllOrigins: returns full HTML + HTTP status code
+ * 4. CodeTabs: returns raw HTML
  */
 async function fetchThroughProxyChain(
   targetUrl: string,
-  signal: AbortSignal
+  signal: AbortSignal,
+  timeoutMs: number = 18000
 ): Promise<ProxyFetchResult | null> {
   // 0. Direct fetch attempt (fastest if server allows CORS or in Node)
   try {
@@ -383,9 +431,37 @@ async function fetchThroughProxyChain(
   // 1. Jina Reader: https://r.jina.ai/{targetUrl}
   try {
     if (signal.aborted) return null;
-    const resJina = await fetchProxyUrl(`https://r.jina.ai/${targetUrl}`, 3200, signal);
+    const jinaTimeoutSec = Math.min(Math.max(Math.round(timeoutMs / 1000), 15), 35);
+    const resJina = await fetchProxyUrl(
+      `https://r.jina.ai/${targetUrl}`,
+      timeoutMs,
+      signal,
+      {
+        'x-timeout': String(jinaTimeoutSec),
+        'x-wait-until': 'domcontentloaded',
+        'x-no-cache': 'true',
+      }
+    );
+
+    const text = await resJina.text();
+
+    // Check if Jina returned an SSL certificate error for an HTTPS target
+    if (resJina.status === 422 && targetUrl.startsWith('https://')) {
+      if (
+        text.includes('ERR_CERT_') ||
+        text.includes('ERR_SSL_') ||
+        text.includes('certificate') ||
+        text.includes('CERT_COMMON_NAME_INVALID')
+      ) {
+        return {
+          html: '',
+          httpCode: 422,
+          sslCertError: true,
+        };
+      }
+    }
+
     if (resJina.ok || resJina.status === 404 || resJina.status === 410) {
-      const text = await resJina.text();
       if (text && text.trim().length > 20) {
         return {
           html: text,
@@ -402,7 +478,7 @@ async function fetchThroughProxyChain(
     if (signal.aborted) return null;
     const resAllOrigins = await fetchProxyUrl(
       `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`,
-      3200,
+      Math.min(timeoutMs, 14000),
       signal
     );
     if (resAllOrigins.ok) {
@@ -427,7 +503,7 @@ async function fetchThroughProxyChain(
     if (signal.aborted) return null;
     const resCodeTabs = await fetchProxyUrl(
       `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`,
-      3200,
+      Math.min(timeoutMs, 14000),
       signal
     );
     if (resCodeTabs.ok || resCodeTabs.status === 404 || resCodeTabs.status === 410) {
@@ -444,6 +520,34 @@ async function fetchThroughProxyChain(
   }
 
   return null;
+}
+
+/**
+ * Detects whether the page is currently in an incomplete loading or spinner state
+ */
+function isPageStillLoading(html: string, text: string): boolean {
+  if (text.length < 90) {
+    const lowerText = text.toLowerCase();
+    const lowerHtml = html.toLowerCase();
+    if (
+      lowerText.includes('loading...') ||
+      lowerText.includes('loading') ||
+      lowerText.includes('please wait') ||
+      lowerText.includes('one moment') ||
+      lowerHtml.includes('class="spinner') ||
+      lowerHtml.includes('id="spinner') ||
+      lowerHtml.includes('class="loader') ||
+      lowerHtml.includes('id="loader') ||
+      lowerHtml.includes('class="loading') ||
+      lowerHtml.includes('id="loading') ||
+      lowerHtml.includes('<div id="root"></div>') ||
+      lowerHtml.includes('<div id="app"></div>') ||
+      lowerHtml.includes('<div id="__next"></div>')
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -609,13 +713,21 @@ export function analyzeHtmlContent(
     };
   }
 
-  // === Distinguish server bot blocks from website failures ===
+  // === Distinguish server bot blocks and server responses from website failures ===
   // If the server returns 401, 403, 405, 429 or a Cloudflare/WAF challenge,
   // the server is actively running and responding (automated requests restricted).
   if (httpCode === 401 || httpCode === 403 || httpCode === 405 || httpCode === 429) {
     return {
       isLive: true,
       reason: `Server responded with HTTP ${httpCode} (automated access restricted)`,
+    };
+  }
+
+  // HTTP 500, 502, 503, 504 are web server responses from an active web server (maintenance/error)
+  if (httpCode === 500 || httpCode === 502 || httpCode === 503 || httpCode === 504) {
+    return {
+      isLive: true,
+      reason: `Server responded with HTTP ${httpCode} (web server active)`,
     };
   }
 
@@ -698,107 +810,140 @@ export function analyzeHtmlContent(
 }
 
 /**
- * Checks website availability using protocol prioritization and proxy fallback:
- * 1. Checks candidate URLs:
- *    - If direct SSL succeeded -> prioritize HTTPS, then HTTP fallback
- *    - If direct SSL failed -> prioritize HTTP first (fast recovery for invalid SSL / HTTP-only sites), then HTTPS
- * 2. Fetches through resilient proxy chain (Jina -> AllOrigins -> CodeTabs) with 4.5s timeout per proxy.
- * 3. Handles redirect stubs (JS redirects and meta refresh).
- * 4. Analyzes rendered page content and HTTP status.
- * 5. Returns Website = "yes" for normal websites (even when SSL check is "no").
- * 6. Returns Website = "no" for specific error/parked pages or completely unreachable hosts.
+ * Checks website availability using intelligent page loading, protocol prioritization,
+ * and automatic retries for slow-loading websites:
+ * 1. Intelligent loading: uses domcontentloaded, increased timeouts up to 30-45s per domain.
+ * 2. Automatic retries: if attempt 1 is inconclusive, retries automatically with progressively longer waiting periods.
+ * 3. Protocol order: tries HTTPS and HTTP (prioritizing HTTP if SSL failed or had certificate errors).
+ * 4. Website detection: returns "yes" when meaningful content, logo, navigation, headings, or images appear.
+ * 5. Returns "no" only for definitive 404 / "Sorry! That page cannot be found...", Namecheap expired domain,
+ *    or confirmed permanent DNS/connection failures.
  */
 export async function checkWebsiteWithContentAnalysis(
   domain: string,
-  sslSucceeded: boolean,
-  signal: AbortSignal
+  signal: AbortSignal,
+  dnsResolves: boolean = true
 ): Promise<{ website: FlagValue; websiteReason?: string }> {
-  // Protocol candidate ordering:
-  // If SSL failed, try HTTP first so we don't hang on a dead HTTPS port
-  const candidateUrls = sslSucceeded
-    ? [
-        `https://${domain}`,
-        `http://${domain}`,
-        `https://www.${domain}`,
-        `http://www.${domain}`,
-      ]
-    : [
-        `http://${domain}`,
-        `https://${domain}`,
-        `http://www.${domain}`,
-        `https://www.${domain}`,
-      ];
+  const cleanHost = domain.replace(/^(www\.)+/i, '');
 
   let gotAnyHtml = false;
   let lastFailureReason = 'Could not retrieve page content';
+  let hadSslCertError = false;
 
-  for (const candidateUrl of candidateUrls) {
+  // Maximum of 2 attempts (Attempt 1: intelligent load, Attempt 2: extended retry for slow sites)
+  for (let attempt = 1; attempt <= 2; attempt++) {
     if (signal.aborted) break;
 
-    const proxyData = await fetchThroughProxyChain(candidateUrl, signal);
-    if (!proxyData) {
-      continue;
-    }
+    // Timeout per proxy attempt: 18s on attempt 1, 26s on attempt 2
+    const attemptTimeoutMs = attempt === 1 ? 18000 : 26000;
 
-    gotAnyHtml = true;
+    // Determine candidate URL order:
+    // If previously encountered SSL cert error on HTTPS: HTTP first, then HTTPS
+    // Otherwise: HTTPS first, then HTTP fallback
+    const candidateUrls = hadSslCertError
+      ? [
+          `http://${domain}`,
+          `https://${domain}`,
+          `http://www.${cleanHost}`,
+          `https://www.${cleanHost}`,
+        ]
+      : [
+          `https://${domain}`,
+          `http://${domain}`,
+          `https://www.${cleanHost}`,
+          `http://www.${cleanHost}`,
+        ];
 
-    // Step 2 — Redirect stub: if HTML < 5KB and has redirect target
-    if (proxyData.html.length < 5120) {
-      const redirectTarget = extractRedirectDestination(proxyData.html, candidateUrl);
-      if (redirectTarget && redirectTarget !== candidateUrl) {
-        // Fetch destination through same chain (max 1 extra hop)
-        const hopData = await fetchThroughProxyChain(redirectTarget, signal);
-        if (hopData) {
-          const hopAnalysis = analyzeHtmlContent(hopData.html, hopData.httpCode);
-          if (hopAnalysis.isLive) {
-            return { website: 'yes' };
-          } else {
-            return { website: 'no', websiteReason: hopAnalysis.reason };
+    for (const candidateUrl of candidateUrls) {
+      if (signal.aborted) break;
+
+      const proxyData = await fetchThroughProxyChain(candidateUrl, signal, attemptTimeoutMs);
+      if (!proxyData) {
+        continue;
+      }
+
+      // If an SSL certificate error was identified on HTTPS, note it and prioritize HTTP
+      if (proxyData.sslCertError) {
+        hadSslCertError = true;
+        continue;
+      }
+
+      gotAnyHtml = true;
+
+      // Check if redirect stub (JS redirect or meta refresh)
+      let finalHtml = proxyData.html;
+      let finalHttpCode = proxyData.httpCode;
+
+      if (proxyData.html.length < 5120) {
+        const redirectTarget = extractRedirectDestination(proxyData.html, candidateUrl);
+        if (redirectTarget && redirectTarget !== candidateUrl) {
+          const hopData = await fetchThroughProxyChain(redirectTarget, signal, attemptTimeoutMs);
+          if (hopData && hopData.html) {
+            finalHtml = hopData.html;
+            finalHttpCode = hopData.httpCode;
           }
+        }
+      }
+
+      // Check if page is in an incomplete loading or spinner state
+      if (isPageStillLoading(finalHtml, finalHtml.replace(/<[^>]+>/g, ' ').trim()) && attempt === 1 && !signal.aborted) {
+        await delay(1500);
+        const reloadData = await fetchThroughProxyChain(candidateUrl, signal, attemptTimeoutMs);
+        if (reloadData && reloadData.html) {
+          finalHtml = reloadData.html;
+          finalHttpCode = reloadData.httpCode;
+        }
+      }
+
+      // Analyze page content
+      const analysis = analyzeHtmlContent(finalHtml, finalHttpCode);
+      if (analysis.isLive) {
+        return {
+          website: 'yes',
+          websiteReason: attempt > 1 ? `${analysis.reason || 'Live website verified'} (loaded after retry)` : analysis.reason,
+        };
+      } else {
+        lastFailureReason = analysis.reason || 'Failed content analysis';
+        if (analysis.isDefinitiveError) {
+          return { website: 'no', websiteReason: analysis.reason };
         }
       }
     }
 
-    // Step 3 — Content analysis
-    const analysis = analyzeHtmlContent(proxyData.html, proxyData.httpCode);
-    if (analysis.isLive) {
-      return { website: 'yes' };
-    } else {
-      lastFailureReason = analysis.reason || 'Failed content analysis';
-      if (analysis.isDefinitiveError) {
-        return { website: 'no', websiteReason: analysis.reason };
-      }
+    // If attempt 1 did not produce a result, wait before progressive retry
+    if (attempt < 2 && !signal.aborted) {
+      await delay(1000);
     }
   }
 
-  // If we obtained HTML on any attempt and it failed analysis (e.g. 404 or expired) -> "no"
+  // If HTML was obtained on any attempt and failed analysis (e.g. parked/for sale) -> "no"
   if (gotAnyHtml) {
     return { website: 'no', websiteReason: lastFailureReason };
   }
 
-  // Step 4 — Fallback when proxies were blocked from reading HTML:
-  // - If direct SSL fetch succeeded in browser -> "yes"
-  // - If nothing responded at all -> "no"
-  if (sslSucceeded) {
+  // If DNS confirmed failed and all connection attempts failed -> "no"
+  if (!dnsResolves) {
     return {
-      website: 'yes',
-      websiteReason: 'Direct HTTPS connection succeeded (proxies blocked from reading HTML)',
+      website: 'no',
+      websiteReason: 'Permanent DNS failure: domain does not resolve',
     };
   }
 
+  // If DNS resolves but connection timed out after retries, return inconclusive '?'
+  // (per requirement 4: do not falsely report a confirmed website failure when slow)
   return {
-    website: 'no',
-    websiteReason: 'All connection attempts and proxies failed',
+    website: '?',
+    websiteReason: 'Connection timed out after retries (server may be slow or restricted)',
   };
 }
 
 /**
- * Checks a single domain with a 12s timeout AbortController.
+ * Checks a single domain with an intelligent 40s timeout AbortController.
  * One bad domain never crashes or stops the whole run.
  */
 export async function checkSingleDomain(
   domain: string,
-  timeoutMs: number = 12000,
+  timeoutMs: number = 40000,
   parentSignal?: AbortSignal
 ): Promise<CheckResultData> {
   const startTime = performance.now();
@@ -828,33 +973,24 @@ export async function checkSingleDomain(
 
   try {
     // 1. Direct SSL check (browser-direct) and Google DNS
+    // 2. Primary WHOIS lookup (RDAP with retries + registry fallback)
+    // and Supplementary Whois.com lookup (pattern: https://www.whois.com/whois/{domain})
+    // 3. Website content analysis with intelligent loading and retries
+    // NOTE: SSL Check and Website Check operate completely independently.
     try {
-      [dnsResult, sslResult] = await Promise.all([
+      [dnsResult, sslResult, whoisResult, whoisComData, websiteResult] = await Promise.all([
         checkGoogleDns(domain, controller.signal),
         checkSslDirect(domain, controller.signal),
+        checkWhoisWithRetries(domain, controller.signal),
+        fetchWhoisComData(domain, controller.signal),
+        checkWebsiteWithContentAnalysis(
+          domain,
+          controller.signal,
+          dnsResult.resolves
+        ),
       ]);
     } catch {
       // Continue with whatever succeeded
-    }
-
-    // 2. Primary WHOIS lookup (RDAP with retries + registry fallback)
-    // and Supplementary Whois.com lookup (pattern: https://www.whois.com/whois/{domain})
-    // 3. Website content analysis
-    try {
-      [whoisResult, whoisComData, websiteResult] = await Promise.all([
-        checkWhoisWithRetries(domain, controller.signal),
-        fetchWhoisComData(domain, controller.signal),
-        checkWebsiteWithContentAnalysis(domain, sslResult === 'yes', controller.signal),
-      ]);
-    } catch {
-      // If content analysis was interrupted or timed out, but direct SSL succeeded,
-      // the website is verified as accessible:
-      if (websiteResult.website !== 'yes' && sslResult === 'yes') {
-        websiteResult = {
-          website: 'yes',
-          websiteReason: 'Direct HTTPS connection succeeded',
-        };
-      }
     }
 
     let registeredOn = whoisResult.registeredOn;
@@ -870,19 +1006,6 @@ export async function checkSingleDomain(
     }
     if (!registrar && whoisComData?.registrar) {
       registrar = whoisComData.registrar;
-    }
-
-    // Fallback: if website check couldn't read HTML but direct SSL succeeded
-    if (
-      websiteResult.website !== 'yes' &&
-      sslResult === 'yes' &&
-      !websiteResult.websiteReason?.includes('404') &&
-      !websiteResult.websiteReason?.includes('expired')
-    ) {
-      websiteResult = {
-        website: 'yes',
-        websiteReason: 'Direct HTTPS connection succeeded (proxies blocked from reading HTML)',
-      };
     }
 
     const durationMs = Math.round(performance.now() - startTime);
@@ -902,14 +1025,13 @@ export async function checkSingleDomain(
     };
   } catch (err: any) {
     const durationMs = Math.round(performance.now() - startTime);
-    const finalWebsite = sslResult === 'yes' ? 'yes' : 'no';
     return {
       registeredOn: whoisResult.registeredOn || 'no data',
       updatedOn: whoisResult.updatedOn || 'no data',
       registrar: whoisResult.registrar,
       ssl: sslResult,
-      website: finalWebsite,
-      websiteReason: finalWebsite === 'yes' ? 'Direct HTTPS connection succeeded' : 'Check failed',
+      website: websiteResult.website !== 'pending' ? websiteResult.website : (dnsResult.resolves ? '?' : 'no'),
+      websiteReason: websiteResult.websiteReason || 'Check failed',
       error: err?.message || 'Check failed',
       durationMs,
     };

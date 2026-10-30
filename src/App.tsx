@@ -93,7 +93,7 @@ export default function App() {
   }, [stopTimer]);
 
   // Start new verification batch
-  const handleStartCheck = (domains: string[], concurrency = 4, timeoutMs = 12000) => {
+  const handleStartCheck = (domains: string[], concurrency = 4, timeoutMs = 40000) => {
     stopTimer();
 
     const newRecords: DomainRecord[] = domains.map((d, index) => ({
@@ -171,7 +171,7 @@ export default function App() {
       )
     );
 
-    const result = await checkSingleDomain(record.domain, 12000);
+    const result = await checkSingleDomain(record.domain, 40000);
 
     setRecords((prev) =>
       prev.map((r) =>
@@ -230,7 +230,7 @@ export default function App() {
 
     const runner = new DomainQueueRunner({
       concurrency: 4,
-      timeoutMs: 12000,
+      timeoutMs: 40000,
       onUpdate: handleRecordUpdate,
       onFinish: () => {
         setIsRunning(false);

@@ -22,7 +22,7 @@ export class DomainQueueRunner {
 
   constructor(options: QueueOptions) {
     this.concurrency = options.concurrency || 4;
-    this.timeoutMs = options.timeoutMs || 12000;
+    this.timeoutMs = options.timeoutMs || 40000;
     this.onUpdate = options.onUpdate;
     this.onFinish = options.onFinish;
   }

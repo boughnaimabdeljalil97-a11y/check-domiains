@@ -71,7 +71,7 @@ export const DomainInput: React.FC<DomainInputProps> = ({ onStartCheck, isRunnin
 
   const handleStart = () => {
     if (cleanedDomains.length === 0 || isRunning) return;
-    onStartCheck(cleanedDomains, 4, 12000);
+    onStartCheck(cleanedDomains, 4, 40000);
   };
 
   return (
